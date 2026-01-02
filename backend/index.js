@@ -36,7 +36,6 @@ Output ONLY valid JSON matching this schema:
 
 {
   "worldName": string,
-  "seed": number (between 1 and 999999),
   "biomes": [
     { 
       "type": string, 
@@ -53,12 +52,9 @@ Output ONLY valid JSON matching this schema:
   ]
 }
 
-Important: 
-- elevationRange should use values between -20 and 20
-- Lower elevations (negative values) = valleys/water
-- Higher elevations (positive values) = hills/mountains
-- roughness around 0.5 is good for most terrains
-- Biome elevation ranges should not overlap too much
+Note: Do NOT include a seed field - it will be generated automatically.
+Lower elevations (negative values) = valleys/water
+Higher elevations (positive values) = hills/mountains
 `,
         },
         {
@@ -73,6 +69,10 @@ Important:
     let worldSpec;
     try {
       worldSpec = JSON.parse(rawContent);
+
+      // ALWAYS generate a fresh random seed on the server
+      worldSpec.seed = Math.floor(Math.random() * 999000) + 1000;
+      console.log("Generated seed:", worldSpec.seed);
     } catch (parseErr) {
       return res.status(500).json({
         error: "Failed to parse world specification",
@@ -93,5 +93,4 @@ Important:
     res.status(500).json({ error: "World generation failed." });
   }
 });
-
 app.listen(4000, () => console.log("Backend running on port 4000"));

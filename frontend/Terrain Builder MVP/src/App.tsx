@@ -271,6 +271,9 @@ export default function WorldGenerator() {
     setLoading(true);
     setError("");
 
+    // Clear the random grid cache before generating new world
+    randomGrids.clear();
+
     try {
       const response = await fetch("http://localhost:4000/generate-world", {
         method: "POST",
