@@ -17,7 +17,6 @@ class SeededRandom {
   }
 }
 
-// Improved Perlin-style noise with interpolation
 function smoothstep(t: number): number {
   return t * t * (3 - 2 * t);
 }
@@ -26,13 +25,23 @@ function lerp(a: number, b: number, t: number): number {
   return a + (b - a) * t;
 }
 
-function generateNoise(x: number, y: number, seed: number, roughness: number): number {
+// FIX 1: Better hash function for corner gradients — each corner gets a
+// truly independent random value based on its grid coords + seed + octave.
+function hashCorner(ix: number, iy: number, seed: number, octave: number): number {
+  // Use a proper integer hash (Wang hash style) to avoid repetition patterns
+  let h = seed ^ (ix * 1619 + iy * 31337 + octave * 6791);
+  h = ((h >>> 16) ^ h) * 0x45d9f3b;
+  h = ((h >>> 16) ^ h) * 0x45d9f3b;
+  h = (h >>> 16) ^ h;
+  // Map to [-1, 1]
+  return ((h & 0xffff) / 0xffff) * 2 - 1;
+}
+
+function generateNoise(x: number, y: number, seed: number, roughness: number, octaves: number = 6): number {
   let total = 0;
   let frequency = 1;
   let amplitude = 1;
   let maxValue = 0;
-  
-  const octaves = 6;
   
   for (let i = 0; i < octaves; i++) {
     const sampleX = x * frequency;
@@ -43,18 +52,14 @@ function generateNoise(x: number, y: number, seed: number, roughness: number): n
     const y0 = Math.floor(sampleY);
     const y1 = y0 + 1;
     
-    const random = new SeededRandom(seed + x0 * 374761393 + y0 * 668265263 + i * 1013);
-    
     const sx = smoothstep(sampleX - x0);
     const sy = smoothstep(sampleY - y0);
     
-    const n00 = random.next() * 2 - 1;
-    random.next();
-    const n10 = random.next() * 2 - 1;
-    random.next();
-    const n01 = random.next() * 2 - 1;
-    random.next();
-    const n11 = random.next() * 2 - 1;
+    // FIX 1: Each corner uses its own independent hash — no shared RNG instance
+    const n00 = hashCorner(x0, y0, seed, i);
+    const n10 = hashCorner(x1, y0, seed, i);
+    const n01 = hashCorner(x0, y1, seed, i);
+    const n11 = hashCorner(x1, y1, seed, i);
     
     const nx0 = lerp(n00, n10, sx);
     const nx1 = lerp(n01, n11, sx);
@@ -90,16 +95,22 @@ interface WorldSpec {
 
 interface TerrainProps {
   worldSpec: WorldSpec;
+  devSettings: {
+    terrainSize: number;
+    segments: number;
+    noiseScale: number;
+    heightScale: number;
+    octaves: number;
+  };
 }
 
-function Terrain({ worldSpec }: TerrainProps) {
+function Terrain({ worldSpec, devSettings }: TerrainProps) {
   const meshRef = useRef<THREE.Mesh>(null);
   const [geometry, setGeometry] = useState<THREE.BufferGeometry | null>(null);
 
   useEffect(() => {
-    const size = 100;
-    const segments = 200; // Higher resolution for smoother terrain
-    const geo = new THREE.PlaneGeometry(size, size, segments, segments);
+    const { terrainSize, segments, noiseScale, octaves } = devSettings;
+    const geo = new THREE.PlaneGeometry(terrainSize, terrainSize, segments, segments);
     
     const positions = geo.attributes.position.array as Float32Array;
     const colors = new Float32Array(positions.length);
@@ -110,7 +121,6 @@ function Terrain({ worldSpec }: TerrainProps) {
     const maxElevation = Math.max(...sortedBiomes.map(b => b.elevationRange[1]));
     const elevationRange = maxElevation - minElevation;
     
-    // Determine terrain style based on biomes
     const hasMountains = sortedBiomes.some(b => 
       b.type.toLowerCase().includes('mountain') || 
       b.type.toLowerCase().includes('peak') ||
@@ -122,12 +132,11 @@ function Terrain({ worldSpec }: TerrainProps) {
       b.type.toLowerCase().includes('forest')
     );
     
-    // Adjust height scale based on terrain type
     let heightScale = 30;
     if (!hasMountains && !hasHills) {
-      heightScale = 5; // Very flat for pure grasslands/plains
+      heightScale = 5;
     } else if (!hasMountains && hasHills) {
-      heightScale = 12; // Gentle rolling hills
+      heightScale = 12;
     }
     
     const getBiomeColor = (biomeType: string): THREE.Color => {
@@ -153,7 +162,7 @@ function Terrain({ worldSpec }: TerrainProps) {
       }
     };
     
-    // First pass: Generate raw heights
+    // First pass: generate raw heights
     const heightMap: number[][] = [];
     for (let iy = 0; iy <= segments; iy++) {
       heightMap[iy] = [];
@@ -161,7 +170,7 @@ function Terrain({ worldSpec }: TerrainProps) {
         const x = (ix / segments - 0.5) * 2;
         const y = (iy / segments - 0.5) * 2;
         
-        const noiseValue = generateNoise(x * 2, y * 2, worldSpec.seed, worldSpec.terrain.roughness);
+        const noiseValue = generateNoise(x * noiseScale, y * noiseScale, worldSpec.seed, worldSpec.terrain.roughness, octaves);
         const normalizedNoise = (noiseValue + 1) / 2;
         const elevation = minElevation + normalizedNoise * elevationRange;
         
@@ -169,9 +178,8 @@ function Terrain({ worldSpec }: TerrainProps) {
       }
     }
     
-    // Second pass: Apply erosion-style smoothing
+    // Second pass: smoothing
     const smoothedHeightMap: number[][] = [];
-    // Increase smoothing for flatter terrains
     const smoothRadius = (!hasMountains && !hasHills) ? 2 : 1;
     
     for (let iy = 0; iy <= segments; iy++) {
@@ -198,7 +206,7 @@ function Terrain({ worldSpec }: TerrainProps) {
       }
     }
     
-    // Third pass: Apply to geometry with colors
+    // Third pass: apply to geometry with colors
     for (let i = 0; i < positions.length; i += 3) {
       const vertexIndex = i / 3;
       const ix = vertexIndex % (segments + 1);
@@ -217,24 +225,49 @@ function Terrain({ worldSpec }: TerrainProps) {
         slope = Math.sqrt(dh_dx * dh_dx + dh_dy * dh_dy);
       }
       
+      // FIX 2: Find the closest biome by elevation distance rather than strict range check.
+      // This ensures every vertex gets a valid color, preventing fallback to gray/black.
       let color = new THREE.Color(0x808080);
-      
+      let bestBiome = sortedBiomes[0];
+      let bestDistance = Infinity;
+
       for (const biome of sortedBiomes) {
         const [minElev, maxElev] = biome.elevationRange;
         if (elevation >= minElev && elevation <= maxElev) {
-          color = getBiomeColor(biome.type);
-          
-          // Darken steep slopes (adds realism)
-          const slopeInfluence = Math.min(slope * 50, 0.3);
-          color.offsetHSL(0, 0, -slopeInfluence);
-          
-          // Add subtle height-based variation
-          const heightVariation = ((elevation - minElev) / (maxElev - minElev) - 0.5) * 0.1;
-          color.offsetHSL(0, 0, heightVariation);
-          
+          // Perfect match — use it directly
+          bestBiome = biome;
+          bestDistance = 0;
           break;
         }
+        // Outside range — measure how far outside
+        const dist = elevation < minElev
+          ? minElev - elevation
+          : elevation - maxElev;
+        if (dist < bestDistance) {
+          bestDistance = dist;
+          bestBiome = biome;
+        }
       }
+
+      color = getBiomeColor(bestBiome.type);
+
+      // FIX 3: Clamp slope darkening so it never pushes colors to black.
+      // Previously slopeInfluence could reach 0.3, which crushes dark greens to black.
+      const slopeInfluence = Math.min(slope * 30, 0.15); // halved max darkness
+      color.offsetHSL(0, 0, -slopeInfluence);
+
+      // Subtle height-based variation — kept small to avoid darkening
+      const [minElev, maxElev] = bestBiome.elevationRange;
+      const rangeSpan = maxElev - minElev;
+      const heightVariation = rangeSpan > 0
+        ? ((elevation - minElev) / rangeSpan - 0.5) * 0.08
+        : 0;
+      color.offsetHSL(0, 0, heightVariation);
+
+      // Clamp to ensure no channel goes negative (avoids black artifacts)
+      color.r = Math.max(0.05, color.r);
+      color.g = Math.max(0.05, color.g);
+      color.b = Math.max(0.05, color.b);
       
       colors[i] = color.r;
       colors[i + 1] = color.g;
@@ -246,7 +279,7 @@ function Terrain({ worldSpec }: TerrainProps) {
     geo.computeVertexNormals();
     
     setGeometry(geo);
-  }, [worldSpec]);
+  }, [worldSpec, devSettings]);
 
   if (!geometry) return null;
 
@@ -310,6 +343,15 @@ export default function WorldGenerator() {
   const [worldSpec, setWorldSpec] = useState<WorldSpec | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  
+  const [showDevControls, setShowDevControls] = useState(false);
+  const [devSettings, setDevSettings] = useState({
+    terrainSize: 100,
+    segments: 200,
+    noiseScale: 2,
+    heightScale: 30,
+    octaves: 6,
+  });
 
   const generateWorld = async () => {
     if (!prompt.trim()) {
@@ -353,7 +395,23 @@ export default function WorldGenerator() {
   return (
     <div style={{ width: '100vw', height: '100vh', background: '#1a1a2e', color: '#fff', fontFamily: 'system-ui, -apple-system, sans-serif' }}>
       <div style={{ padding: '20px', background: '#16213e', borderBottom: '2px solid #0f3460' }}>
-        <h1 style={{ margin: '0 0 15px 0', fontSize: '28px', fontWeight: '600' }}>World Generator MVP</h1>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '15px' }}>
+          <h1 style={{ margin: 0, fontSize: '28px', fontWeight: '600' }}>World Generator MVP</h1>
+          <button
+            onClick={() => setShowDevControls(!showDevControls)}
+            style={{
+              padding: '8px 16px',
+              background: '#533483',
+              border: 'none',
+              borderRadius: '6px',
+              color: '#fff',
+              fontSize: '14px',
+              cursor: 'pointer',
+            }}
+          >
+            {showDevControls ? '🔧 Hide Dev Tools' : '🔧 Show Dev Tools'}
+          </button>
+        </div>
         
         <div style={{ display: 'flex', gap: '10px', maxWidth: '800px' }}>
           <input
@@ -397,6 +455,120 @@ export default function WorldGenerator() {
             {error}
           </div>
         )}
+
+        {showDevControls && (
+          <div style={{ 
+            marginTop: '15px', 
+            padding: '15px', 
+            background: 'rgba(83, 52, 131, 0.2)', 
+            borderRadius: '8px',
+            border: '1px solid #533483'
+          }}>
+            <h3 style={{ margin: '0 0 10px 0', fontSize: '16px', color: '#e94560' }}>🔧 Development Controls</h3>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '15px' }}>
+              
+              <div>
+                <label style={{ display: 'block', fontSize: '13px', marginBottom: '5px', opacity: 0.8 }}>
+                  Terrain Size: {devSettings.terrainSize}
+                </label>
+                <input
+                  type="range"
+                  min="50"
+                  max="200"
+                  value={devSettings.terrainSize}
+                  onChange={(e) => setDevSettings({...devSettings, terrainSize: Number(e.target.value)})}
+                  style={{ width: '100%' }}
+                />
+                <span style={{ fontSize: '11px', opacity: 0.6 }}>Physical world size in units</span>
+              </div>
+
+              <div>
+                <label style={{ display: 'block', fontSize: '13px', marginBottom: '5px', opacity: 0.8 }}>
+                  Resolution: {devSettings.segments}
+                </label>
+                <input
+                  type="range"
+                  min="50"
+                  max="300"
+                  step="10"
+                  value={devSettings.segments}
+                  onChange={(e) => setDevSettings({...devSettings, segments: Number(e.target.value)})}
+                  style={{ width: '100%' }}
+                />
+                <span style={{ fontSize: '11px', opacity: 0.6 }}>Higher = smoother (slower)</span>
+              </div>
+
+              <div>
+                <label style={{ display: 'block', fontSize: '13px', marginBottom: '5px', opacity: 0.8 }}>
+                  Noise Scale: {devSettings.noiseScale.toFixed(1)}
+                </label>
+                <input
+                  type="range"
+                  min="0.5"
+                  max="5"
+                  step="0.1"
+                  value={devSettings.noiseScale}
+                  onChange={(e) => setDevSettings({...devSettings, noiseScale: Number(e.target.value)})}
+                  style={{ width: '100%' }}
+                />
+                <span style={{ fontSize: '11px', opacity: 0.6 }}>Lower = bigger features</span>
+              </div>
+
+              <div>
+                <label style={{ display: 'block', fontSize: '13px', marginBottom: '5px', opacity: 0.8 }}>
+                  Height Scale: {devSettings.heightScale}
+                </label>
+                <input
+                  type="range"
+                  min="5"
+                  max="50"
+                  value={devSettings.heightScale}
+                  onChange={(e) => setDevSettings({...devSettings, heightScale: Number(e.target.value)})}
+                  style={{ width: '100%' }}
+                />
+                <span style={{ fontSize: '11px', opacity: 0.6 }}>Vertical exaggeration</span>
+              </div>
+
+              <div>
+                <label style={{ display: 'block', fontSize: '13px', marginBottom: '5px', opacity: 0.8 }}>
+                  Octaves: {devSettings.octaves}
+                </label>
+                <input
+                  type="range"
+                  min="1"
+                  max="10"
+                  value={devSettings.octaves}
+                  onChange={(e) => setDevSettings({...devSettings, octaves: Number(e.target.value)})}
+                  style={{ width: '100%' }}
+                />
+                <span style={{ fontSize: '11px', opacity: 0.6 }}>Detail layers (higher = more detail)</span>
+              </div>
+
+              <div style={{ display: 'flex', alignItems: 'center' }}>
+                <button
+                  onClick={() => setDevSettings({
+                    terrainSize: 100,
+                    segments: 200,
+                    noiseScale: 2,
+                    heightScale: 30,
+                    octaves: 6,
+                  })}
+                  style={{
+                    padding: '8px 16px',
+                    background: '#0f3460',
+                    border: '1px solid #533483',
+                    borderRadius: '6px',
+                    color: '#fff',
+                    fontSize: '13px',
+                    cursor: 'pointer',
+                  }}
+                >
+                  Reset to Defaults
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
       </div>
 
       {worldSpec && (
@@ -427,7 +599,7 @@ export default function WorldGenerator() {
             <ambientLight intensity={0.4} />
             <directionalLight position={[10, 20, 10]} intensity={1.2} castShadow />
             <directionalLight position={[-10, 10, -10]} intensity={0.4} />
-            <Terrain worldSpec={worldSpec} />
+            <Terrain worldSpec={worldSpec} devSettings={devSettings} />
             <POIMarkers worldSpec={worldSpec} />
             <OrbitControls 
               enableDamping
